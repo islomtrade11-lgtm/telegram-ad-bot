@@ -1,0 +1,13 @@
+app = "telegram-bot-islom-1"
+primary_region = "arn"
+
+[build]
+image = "islomtrade11/telegram-bot:latest"
+
+[env]
+PYTHONUNBUFFERED = "1"
+
+[[vm]]
+cpu_kind = "shared"
+cpus = 1
+memory_mb = 256
