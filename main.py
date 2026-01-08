@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS groups (
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY
+    user_id INTEGER PRIMARY KEY,
+    username TEXT
 )
 """)
 
@@ -71,10 +72,20 @@ def is_allowed(user_id):
     return cursor.fetchone() is not None
 
 
-def add_user(user_id):
-    cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (user_id,))
+def add_user(user_id, username=None):
+    cursor.execute(
+        "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
+        (user_id, username)
+    )
     db.commit()
 
+def remove_user(user_id: int):
+    cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    db.commit()
+
+def get_users():
+    cursor.execute("SELECT user_id FROM users")
+    return [row[0] for row in cursor.fetchall()]
 
 def update_stats(count):
     cursor.execute(
@@ -82,6 +93,10 @@ def update_stats(count):
         (count, datetime.utcnow().isoformat())
     )
     db.commit()
+
+def get_users():
+    cursor.execute("SELECT user_id, username FROM users")
+    return cursor.fetchall()
 
 
 # ================= СОСТОЯНИЯ =================
@@ -121,14 +136,15 @@ start_kb = InlineKeyboardMarkup(
 )
 
 # ================= START =================
+
 @dp.message(Command("start"))
 async def start(message: Message):
     if not is_allowed(message.from_user.id):
         await message.answer("❌ Нет доступа")
         return
 
+    add_user(message.from_user.id, message.from_user.username)
     await message.answer("✅ Бот готов", reply_markup=start_kb)
-
 
 # ================= ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЕЙ =================
 @dp.message(Command("add_user"))
@@ -138,11 +154,43 @@ async def cmd_add_user(message: Message):
 
     try:
         uid = int(message.text.split()[1])
-        add_user(uid)
+        add_user(uid, None)
         await message.answer("✅ Пользователь добавлен")
     except Exception:
         await message.answer("Используй: /add_user <telegram_id>")
+        return
 
+@dp.message(Command("del_user"))
+async def cmd_del_user(message: Message):
+    if message.from_user.id != ROOT_ADMIN_ID:
+        return
+
+    try:
+        uid = int(message.text.split()[1])
+
+        if uid == ROOT_ADMIN_ID:
+            await message.answer("❌ Нельзя удалить главного администратора")
+            return
+
+        remove_user(uid)
+        await message.answer(f"❌ Пользователь {uid} удалён")
+    except Exception:
+        await message.answer("Используй: /del_user <telegram_id>")
+
+    users = get_users()
+
+    if not users:
+        await message.answer("👥 Пользователей нет")
+        return
+
+    text = "👥 Пользователи с доступом:\n\n"
+    for uid, username in users:
+        if username:
+            text += f"• @{username} ({uid})\n"
+        else:
+            text += f"• {uid} (нет username)\n"
+
+    await message.answer(text)
 
 # ================= СТАТИСТИКА =================
 @dp.callback_query(F.data == "stats")
