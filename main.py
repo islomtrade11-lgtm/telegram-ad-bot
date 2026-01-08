@@ -50,7 +50,11 @@ CREATE TABLE IF NOT EXISTS stats (
 """)
 
 cursor.execute("INSERT OR IGNORE INTO stats VALUES (0, '')")
-cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (ROOT_ADMIN_ID,))
+cursor.execute(
+    "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
+    (ROOT_ADMIN_ID, None)
+)
+
 db.commit()
 
 
