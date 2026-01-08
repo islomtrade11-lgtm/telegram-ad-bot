@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -13,10 +13,10 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
-# ================= НАСТРОЙКИ =================
+# ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ROOT_ADMIN_ID = int(os.getenv("ROOT_ADMIN_ID"))
-SEND_DELAY = float(os.getenv("SEND_DELAY", 0.5))
+DEFAULT_DELAY = 2.0  # оптимальный
 # ============================================
 
 logging.basicConfig(level=logging.INFO)
@@ -24,27 +24,21 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ================= БАЗА =================
+# ================== DATABASE ==================
 db = sqlite3.connect("bot.db")
 cursor = db.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    delay REAL
+)
+""")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
     title TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS stats (
-    sent INTEGER,
-    last TEXT
 )
 """)
 
@@ -58,71 +52,94 @@ CREATE TABLE IF NOT EXISTS logs (
 )
 """)
 
-cursor.execute("INSERT OR IGNORE INTO stats VALUES (0, '')")
-cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (ROOT_ADMIN_ID,))
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS stats (
+    sent INTEGER
+)
+""")
+
+cursor.execute("INSERT OR IGNORE INTO stats VALUES (0)")
+cursor.execute(
+    "INSERT OR IGNORE INTO users VALUES (?, ?)",
+    (ROOT_ADMIN_ID, DEFAULT_DELAY)
+)
 db.commit()
 
-# ================= УТИЛИТЫ =================
-def log_action(user_id, action, group_title="-"):
+# ================== HELPERS ==================
+def log_action(uid, action, group="-"):
     cursor.execute(
         "INSERT INTO logs (user_id, action, group_title, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, action, group_title, datetime.utcnow().isoformat())
+        (uid, action, group, datetime.utcnow().isoformat())
     )
     db.commit()
 
+def is_allowed(uid):
+    cursor.execute("SELECT 1 FROM users WHERE user_id=?", (uid,))
+    return cursor.fetchone() is not None
 
-def add_group(chat_id, title):
+def add_user(uid):
+    cursor.execute(
+        "INSERT OR IGNORE INTO users VALUES (?, ?)",
+        (uid, DEFAULT_DELAY)
+    )
+    db.commit()
+
+def remove_user(uid):
+    cursor.execute("DELETE FROM users WHERE user_id=?", (uid,))
+    db.commit()
+
+def get_users():
+    cursor.execute("SELECT user_id, delay FROM users")
+    return cursor.fetchall()
+
+def get_delay(uid):
+    cursor.execute("SELECT delay FROM users WHERE user_id=?", (uid,))
+    row = cursor.fetchone()
+    return row[0] if row else DEFAULT_DELAY
+
+def set_delay(uid, delay):
+    cursor.execute("UPDATE users SET delay=? WHERE user_id=?", (delay, uid))
+    db.commit()
+
+def add_group(cid, title):
     cursor.execute(
         "INSERT OR IGNORE INTO groups VALUES (?, ?)",
-        (chat_id, title)
+        (cid, title)
     )
     db.commit()
-
 
 def get_groups():
     cursor.execute("SELECT chat_id, title FROM groups")
     return cursor.fetchall()
 
-
-def is_allowed(user_id):
-    cursor.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
-    return cursor.fetchone() is not None
-
-
-def add_user(user_id):
-    cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (user_id,))
+def inc_stats(n):
+    cursor.execute("UPDATE stats SET sent = sent + ?", (n,))
     db.commit()
 
-
-def remove_user(user_id):
-    cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    db.commit()
-
-
-def get_users():
-    cursor.execute("SELECT user_id FROM users")
-    return [u[0] for u in cursor.fetchall()]
-
-
-def update_stats(count):
-    cursor.execute(
-        "UPDATE stats SET sent = sent + ?, last = ?",
-        (count, datetime.utcnow().isoformat())
-    )
-    db.commit()
-
-# ================= СОСТОЯНИЯ =================
-class Send(StatesGroup):
+# ================== FSM ==================
+class SendFSM(StatesGroup):
     content = State()
     groups = State()
     count = State()
-    delay = State()
 
-class Admin(StatesGroup):
+class AdminFSM(StatesGroup):
     add_user = State()
-    remove_user = State()
+    set_delay = State()
 
-# ================= КНОПКИ =================
+# ================== KEYBOARDS ==================
+def start_kb(uid):
+    kb = [
+        [InlineKeyboardButton(text="📢 Начать рассылку", callback_data="send")],
+        [InlineKeyboardButton(text="⏱ Установить задержку", callback_data="set_delay")]
+    ]
+    if uid == ROOT_ADMIN_ID:
+        kb += [
+            [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="add_user")],
+            [InlineKeyboardButton(text="👥 Пользователи", callback_data="list_users")],
+            [InlineKeyboardButton(text="🧾 Логи действий", callback_data="logs")]
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
 def groups_kb(selected):
     kb = []
     for cid, title in get_groups():
@@ -133,47 +150,47 @@ def groups_kb(selected):
                 callback_data=f"grp_{cid}"
             )
         ])
-    kb.append([
-        InlineKeyboardButton(text="▶️ Отправить", callback_data="go"),
-        InlineKeyboardButton(text="⏰ Отложить", callback_data="delay"),
-    ])
+    kb.append([InlineKeyboardButton(text="▶️ Отправить", callback_data="go")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-
-def admin_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Начать рассылку", callback_data="send")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="add_user")],
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="list_users")],
-        [InlineKeyboardButton(text="🧾 Логи действий", callback_data="logs")]
-    ])
-
-def user_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Начать рассылку", callback_data="send")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")]
-    ])
-
-# ================= START =================
+# ================== START ==================
 @dp.message(Command("start"))
 async def start(message: Message):
     if not is_allowed(message.from_user.id):
         await message.answer("❌ Нет доступа")
         return
+    d = get_delay(message.from_user.id)
+    await message.answer(
+        f"✅ Бот готов\n⏱ Текущий delay: {d} сек (по умолчанию {DEFAULT_DELAY})",
+        reply_markup=start_kb(message.from_user.id)
+    )
 
-    kb = admin_kb() if message.from_user.id == ROOT_ADMIN_ID else user_kb()
-    await message.answer("✅ Бот готов", reply_markup=kb)
+# ================== SET DELAY ==================
+@dp.callback_query(F.data == "set_delay")
+async def set_delay_btn(call: CallbackQuery, state: FSMContext):
+    await call.message.answer(
+        f"Введи задержку в секундах\n"
+        f"Рекомендуемое значение: {DEFAULT_DELAY} (оптимально)"
+    )
+    await state.set_state(AdminFSM.set_delay)
 
-# ================= АДМИНКА =================
+@dp.message(AdminFSM.set_delay)
+async def save_delay(message: Message, state: FSMContext):
+    delay = float(message.text)
+    set_delay(message.from_user.id, delay)
+    log_action(message.from_user.id, f"Установил delay {delay}")
+    await message.answer(f"✅ Delay установлен: {delay} сек")
+    await state.clear()
+
+# ================== ADMIN ==================
 @dp.callback_query(F.data == "add_user")
 async def add_user_btn(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ROOT_ADMIN_ID:
         return
-    await call.message.answer("Введите Telegram ID пользователя:")
-    await state.set_state(Admin.add_user)
+    await call.message.answer("Введи Telegram ID пользователя:")
+    await state.set_state(AdminFSM.add_user)
 
-@dp.message(Admin.add_user)
+@dp.message(AdminFSM.add_user)
 async def add_user_process(message: Message, state: FSMContext):
     uid = int(message.text)
     add_user(uid)
@@ -183,61 +200,46 @@ async def add_user_process(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "list_users")
 async def list_users(call: CallbackQuery):
-    if call.from_user.id != ROOT_ADMIN_ID:
-        return
     users = get_users()
-    text = "👥 Пользователи:\n" + "\n".join(map(str, users))
+    text = "👥 Пользователи:\n"
+    for u, d in users:
+        text += f"{u} — delay {d}\n"
     await call.message.answer(text)
-
-@dp.message(Command("del_user"))
-async def del_user(message: Message):
-    if message.from_user.id != ROOT_ADMIN_ID:
-        return
-    uid = int(message.text.split()[1])
-    remove_user(uid)
-    log_action(message.from_user.id, f"Удалил пользователя {uid}")
-    await message.answer("❌ Пользователь удалён")
 
 @dp.callback_query(F.data == "logs")
 async def show_logs(call: CallbackQuery):
-    if call.from_user.id != ROOT_ADMIN_ID:
-        return
     cursor.execute(
         "SELECT user_id, action, group_title, created_at FROM logs ORDER BY id DESC LIMIT 20"
     )
     rows = cursor.fetchall()
-    text = "🧾 Последние действия:\n\n"
+    text = "🧾 Логи действий:\n\n"
     for u, a, g, t in rows:
-        text += f"{t}\n👤 {u}\n➡️ {a}\n📌 {g}\n\n"
+        text += f"{t}\n👤 {u}\n➡ {a}\n📌 {g}\n\n"
     await call.message.answer(text)
 
-# ================= ГРУППЫ =================
+# ================== GROUP TRACKING ==================
 @dp.my_chat_member()
 async def bot_added(event):
     if event.new_chat_member.status in ("member", "administrator"):
         add_group(event.chat.id, event.chat.title)
 
-# ================= РАССЫЛКА =================
+# ================== MAILING ==================
 @dp.callback_query(F.data == "send")
 async def start_send(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("✍️ Пришли текст / фото / видео:")
-    await state.set_state(Send.content)
+    await call.message.answer("Пришли сообщение для рассылки:")
+    await state.set_state(SendFSM.content)
 
-@dp.message(Send.content)
+@dp.message(SendFSM.content)
 async def get_content(message: Message, state: FSMContext):
-    data = {"text": message.text, "photo": None, "video": None}
-    if message.photo:
-        data["photo"] = message.photo[-1].file_id
-        data["text"] = message.caption
-    if message.video:
-        data["video"] = message.video.file_id
-        data["text"] = message.caption
+    await state.update_data(
+        text=message.text,
+        groups=set(),
+        user_id=message.from_user.id
+    )
+    await message.answer("Выбери группы:", reply_markup=groups_kb(set()))
+    await state.set_state(SendFSM.groups)
 
-    await state.update_data(**data, groups=set(), user_id=message.from_user.id)
-    await message.answer("📌 Выбери группы:", reply_markup=groups_kb(set()))
-    await state.set_state(Send.groups)
-
-@dp.callback_query(Send.groups)
+@dp.callback_query(SendFSM.groups)
 async def choose_groups(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = set(data["groups"])
@@ -249,48 +251,29 @@ async def choose_groups(call: CallbackQuery, state: FSMContext):
         await call.message.edit_reply_markup(groups_kb(selected))
 
     elif call.data == "go":
-        await call.message.answer("🔁 Сколько раз отправить?")
-        await state.set_state(Send.count)
+        await call.message.answer("Сколько раз отправить сообщение?")
+        await state.set_state(SendFSM.count)
 
-    elif call.data == "delay":
-        await call.message.answer("⏰ Через сколько минут отправить?")
-        await state.set_state(Send.delay)
-
-@dp.message(Send.delay)
-async def set_delay(message: Message, state: FSMContext):
-    minutes = int(message.text)
-    await state.update_data(send_at=datetime.utcnow() + timedelta(minutes=minutes))
-    await message.answer("🔁 Сколько раз отправить?")
-    await state.set_state(Send.count)
-
-@dp.message(Send.count)
+@dp.message(SendFSM.count)
 async def do_send(message: Message, state: FSMContext):
     count = int(message.text)
     data = await state.get_data()
+    delay = get_delay(data["user_id"])
 
-    async def sender():
-        sent = 0
-        for _ in range(count):
-            for gid in data["groups"]:
-                title = next(t for i, t in get_groups() if i == gid)
-                if data["photo"]:
-                    await bot.send_photo(gid, data["photo"], caption=data["text"])
-                elif data["video"]:
-                    await bot.send_video(gid, data["video"], caption=data["text"])
-                else:
-                    await bot.send_message(gid, data["text"])
+    sent = 0
+    for _ in range(count):
+        for gid, title in get_groups():
+            if gid in data["groups"]:
+                await bot.send_message(gid, data["text"])
                 log_action(data["user_id"], "Рассылка", title)
                 sent += 1
-                await asyncio.sleep(SEND_DELAY)
-        update_stats(sent)
+                await asyncio.sleep(delay)
 
-    if "send_at" in data:
-        await asyncio.sleep((data["send_at"] - datetime.utcnow()).total_seconds())
-    await sender()
+    inc_stats(sent)
     await message.answer("✅ Рассылка завершена")
     await state.clear()
 
-# ================= ЗАПУСК =================
+# ================== RUN ==================
 async def main():
     print(">>> BOT STARTED")
     await dp.start_polling(bot)
