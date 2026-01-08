@@ -48,9 +48,27 @@ CREATE TABLE IF NOT EXISTS stats (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT,
+    group_title TEXT,
+    created_at TEXT
+)
+""")
+
 cursor.execute("INSERT OR IGNORE INTO stats VALUES (0, '')")
 cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (ROOT_ADMIN_ID,))
 db.commit()
+
+# ================= УТИЛИТЫ =================
+def log_action(user_id, action, group_title="-"):
+    cursor.execute(
+        "INSERT INTO logs (user_id, action, group_title, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, action, group_title, datetime.utcnow().isoformat())
+    )
+    db.commit()
 
 
 def add_group(chat_id, title):
@@ -76,13 +94,22 @@ def add_user(user_id):
     db.commit()
 
 
+def remove_user(user_id):
+    cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    db.commit()
+
+
+def get_users():
+    cursor.execute("SELECT user_id FROM users")
+    return [u[0] for u in cursor.fetchall()]
+
+
 def update_stats(count):
     cursor.execute(
         "UPDATE stats SET sent = sent + ?, last = ?",
         (count, datetime.utcnow().isoformat())
     )
     db.commit()
-
 
 # ================= СОСТОЯНИЯ =================
 class Send(StatesGroup):
@@ -91,34 +118,42 @@ class Send(StatesGroup):
     count = State()
     delay = State()
 
+class Admin(StatesGroup):
+    add_user = State()
+    remove_user = State()
 
 # ================= КНОПКИ =================
-def groups_kb(selected: set[int]):
-    keyboard = []
-
+def groups_kb(selected):
+    kb = []
     for cid, title in get_groups():
         mark = "✅" if cid in selected else "⬜"
-        keyboard.append([
+        kb.append([
             InlineKeyboardButton(
                 text=f"{mark} {title}",
                 callback_data=f"grp_{cid}"
             )
         ])
-
-    keyboard.append([
+    kb.append([
         InlineKeyboardButton(text="▶️ Отправить", callback_data="go"),
         InlineKeyboardButton(text="⏰ Отложить", callback_data="delay"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Начать рассылку", callback_data="send")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="add_user")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="list_users")],
+        [InlineKeyboardButton(text="🧾 Логи действий", callback_data="logs")]
+    ])
 
-start_kb = InlineKeyboardMarkup(
-    inline_keyboard=[
+def user_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Начать рассылку", callback_data="send")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")]
-    ]
-)
+    ])
 
 # ================= START =================
 @dp.message(Command("start"))
@@ -127,105 +162,109 @@ async def start(message: Message):
         await message.answer("❌ Нет доступа")
         return
 
-    await message.answer("✅ Бот готов", reply_markup=start_kb)
+    kb = admin_kb() if message.from_user.id == ROOT_ADMIN_ID else user_kb()
+    await message.answer("✅ Бот готов", reply_markup=kb)
 
+# ================= АДМИНКА =================
+@dp.callback_query(F.data == "add_user")
+async def add_user_btn(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ROOT_ADMIN_ID:
+        return
+    await call.message.answer("Введите Telegram ID пользователя:")
+    await state.set_state(Admin.add_user)
 
-# ================= ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЕЙ =================
-@dp.message(Command("add_user"))
-async def cmd_add_user(message: Message):
+@dp.message(Admin.add_user)
+async def add_user_process(message: Message, state: FSMContext):
+    uid = int(message.text)
+    add_user(uid)
+    log_action(message.from_user.id, f"Добавил пользователя {uid}")
+    await message.answer("✅ Пользователь добавлен")
+    await state.clear()
+
+@dp.callback_query(F.data == "list_users")
+async def list_users(call: CallbackQuery):
+    if call.from_user.id != ROOT_ADMIN_ID:
+        return
+    users = get_users()
+    text = "👥 Пользователи:\n" + "\n".join(map(str, users))
+    await call.message.answer(text)
+
+@dp.message(Command("del_user"))
+async def del_user(message: Message):
     if message.from_user.id != ROOT_ADMIN_ID:
         return
+    uid = int(message.text.split()[1])
+    remove_user(uid)
+    log_action(message.from_user.id, f"Удалил пользователя {uid}")
+    await message.answer("❌ Пользователь удалён")
 
-    try:
-        uid = int(message.text.split()[1])
-        add_user(uid)
-        await message.answer("✅ Пользователь добавлен")
-    except Exception:
-        await message.answer("Используй: /add_user <telegram_id>")
-
-
-# ================= СТАТИСТИКА =================
-@dp.callback_query(F.data == "stats")
-async def show_stats(call: CallbackQuery):
-    cursor.execute("SELECT sent, last FROM stats")
-    sent, last = cursor.fetchone()
-
-    await call.message.answer(
-        f"📊 Отправлено сообщений: {sent}\n🕒 Последняя рассылка: {last}"
+@dp.callback_query(F.data == "logs")
+async def show_logs(call: CallbackQuery):
+    if call.from_user.id != ROOT_ADMIN_ID:
+        return
+    cursor.execute(
+        "SELECT user_id, action, group_title, created_at FROM logs ORDER BY id DESC LIMIT 20"
     )
+    rows = cursor.fetchall()
+    text = "🧾 Последние действия:\n\n"
+    for u, a, g, t in rows:
+        text += f"{t}\n👤 {u}\n➡️ {a}\n📌 {g}\n\n"
+    await call.message.answer(text)
 
-
-# ================= ДОБАВЛЕНИЕ ГРУПП =================
+# ================= ГРУППЫ =================
 @dp.my_chat_member()
 async def bot_added(event):
     if event.new_chat_member.status in ("member", "administrator"):
         add_group(event.chat.id, event.chat.title)
 
-
 # ================= РАССЫЛКА =================
 @dp.callback_query(F.data == "send")
 async def start_send(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("✍️ Пришли текст / фото / видео для рассылки:")
+    await call.message.answer("✍️ Пришли текст / фото / видео:")
     await state.set_state(Send.content)
-
 
 @dp.message(Send.content)
 async def get_content(message: Message, state: FSMContext):
-    data = {
-        "text": message.text,
-        "photo": None,
-        "video": None,
-    }
-
+    data = {"text": message.text, "photo": None, "video": None}
     if message.photo:
         data["photo"] = message.photo[-1].file_id
         data["text"] = message.caption
-
     if message.video:
         data["video"] = message.video.file_id
         data["text"] = message.caption
 
-    await state.update_data(**data, groups=set())
+    await state.update_data(**data, groups=set(), user_id=message.from_user.id)
     await message.answer("📌 Выбери группы:", reply_markup=groups_kb(set()))
     await state.set_state(Send.groups)
-
 
 @dp.callback_query(Send.groups)
 async def choose_groups(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    selected: set[int] = set(data["groups"])
+    selected = set(data["groups"])
 
     if call.data.startswith("grp_"):
         gid = int(call.data.split("_")[1])
         selected ^= {gid}
         await state.update_data(groups=selected)
-        await call.message.edit_reply_markup(reply_markup=groups_kb(selected))
+        await call.message.edit_reply_markup(groups_kb(selected))
 
     elif call.data == "go":
-        await call.message.answer("🔁 Сколько раз отправить сообщение?")
+        await call.message.answer("🔁 Сколько раз отправить?")
         await state.set_state(Send.count)
 
     elif call.data == "delay":
         await call.message.answer("⏰ Через сколько минут отправить?")
         await state.set_state(Send.delay)
 
-
 @dp.message(Send.delay)
 async def set_delay(message: Message, state: FSMContext):
     minutes = int(message.text)
-    await state.update_data(
-        send_at=datetime.utcnow() + timedelta(minutes=minutes)
-    )
-    await message.answer("🔁 Сколько раз отправить сообщение?")
+    await state.update_data(send_at=datetime.utcnow() + timedelta(minutes=minutes))
+    await message.answer("🔁 Сколько раз отправить?")
     await state.set_state(Send.count)
-
 
 @dp.message(Send.count)
 async def do_send(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("❌ Нужно число")
-        return
-
     count = int(message.text)
     data = await state.get_data()
 
@@ -233,38 +272,28 @@ async def do_send(message: Message, state: FSMContext):
         sent = 0
         for _ in range(count):
             for gid in data["groups"]:
-                try:
-                    if data["photo"]:
-                        await bot.send_photo(gid, data["photo"], caption=data["text"])
-                    elif data["video"]:
-                        await bot.send_video(gid, data["video"], caption=data["text"])
-                    else:
-                        await bot.send_message(gid, data["text"])
-
-                    sent += 1
-                    await asyncio.sleep(SEND_DELAY)
-                except Exception as e:
-                    logging.error(e)
-
+                title = next(t for i, t in get_groups() if i == gid)
+                if data["photo"]:
+                    await bot.send_photo(gid, data["photo"], caption=data["text"])
+                elif data["video"]:
+                    await bot.send_video(gid, data["video"], caption=data["text"])
+                else:
+                    await bot.send_message(gid, data["text"])
+                log_action(data["user_id"], "Рассылка", title)
+                sent += 1
+                await asyncio.sleep(SEND_DELAY)
         update_stats(sent)
 
     if "send_at" in data:
-        delay = (data["send_at"] - datetime.utcnow()).total_seconds()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        await sender()
-    else:
-        await sender()
-
+        await asyncio.sleep((data["send_at"] - datetime.utcnow()).total_seconds())
+    await sender()
     await message.answer("✅ Рассылка завершена")
     await state.clear()
-
 
 # ================= ЗАПУСК =================
 async def main():
     print(">>> BOT STARTED")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
